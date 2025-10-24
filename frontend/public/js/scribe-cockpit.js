@@ -536,6 +536,19 @@ function persistSoapFromUI() {
 
   soap._aiMeta = (latestSoapNote && latestSoapNote._aiMeta) ? latestSoapNote._aiMeta : {};
   soap._editMeta = latestSoapNote?._editMeta || {};
+
+  const medTextarea = scroller.querySelector('textarea[data-section="Medication"]');
+  if (medTextarea) {
+    const medications = (medTextarea.value || '').split('\n')
+      .map(l => l.trim())
+      .filter(Boolean)
+      .map(name => ({
+        name,
+        available: medAvailability.has(name.toLowerCase()) ? medAvailability.get(name.toLowerCase()) : null
+      }));
+    soap.medications = medications;
+  }
+
   latestSoapNote = soap;
   saveLatestSoap(latestSoapNote);
 
@@ -654,7 +667,16 @@ function attachEditTrackingToTextarea(box, aiText) {
 
         // Update inline medication availability if editing Medication section
         if (section === 'Medication') {
+          medAvailability.clear();
           renderMedicationInline();
+
+          if (medicationDebounceTimer) {
+            clearTimeout(medicationDebounceTimer);
+          }
+
+          medicationDebounceTimer = setTimeout(() => {
+            checkMedicationsFromTextarea(box);
+          }, 600);
         }
 
       } catch (e) { console.warn('[SCRIBE] input handler error', e); }
@@ -757,6 +779,104 @@ function renderSoapNoteGenerating(elapsed) {
 // Simple boolean state: Map<lowercasedName, boolean>
 const medAvailability = new Map();
 
+// Validation state
+let medicationValidationPending = false;
+let medicationDebounceTimer = null;
+
+async function checkMedicationsFromTextarea(textarea) {
+  if (!textarea) return;
+
+  const lines = (textarea.value || '').split('\n')
+    .map(l => l.trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) {
+    medAvailability.clear();
+    renderMedicationInline();
+    return;
+  }
+
+  medicationValidationPending = true;
+  showPendingIndicators();
+
+  try {
+    const response = await fetch(`${SERVER_URL}/api/medications/availability`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ names: lines })
+    });
+
+    if (!response.ok) {
+      console.warn('[MED_CHECK] API error:', response.status);
+      medicationValidationPending = false;
+      return;
+    }
+
+    const data = await response.json();
+    const results = data.results || [];
+
+    medAvailability.clear();
+    results.forEach(item => {
+      const name = (item.name || '').trim().toLowerCase();
+      if (name) {
+        medAvailability.set(name, !!item.available);
+      }
+    });
+
+    medicationValidationPending = false;
+    renderMedicationInline();
+    updateAddToEhrButtonState();
+  } catch (err) {
+    console.error('[MED_CHECK] Error:', err);
+    medicationValidationPending = false;
+  }
+}
+
+function showPendingIndicators() {
+  const scroller = soapContainerEnsure();
+  const medSection = scroller.querySelector('.scribe-section[data-section="Medication"]');
+  if (!medSection) return;
+
+  const wrap = ensureMedicationWrap(medSection);
+  const overlay = wrap?.querySelector('.med-overlay');
+  if (!overlay) return;
+
+  const frag = document.createDocumentFragment();
+  const textarea = medSection.querySelector('textarea[data-section="Medication"]');
+  const lines = (textarea?.value || '').split('\n');
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    const row = document.createElement('div');
+    row.className = 'med-line';
+
+    const nameSpan = document.createElement('span');
+    nameSpan.textContent = line;
+    row.appendChild(nameSpan);
+
+    if (line) {
+      const badge = document.createElement('span');
+      badge.className = 'med-badge pending';
+      badge.textContent = '⏳';
+      row.appendChild(badge);
+    }
+
+    frag.appendChild(row);
+  }
+
+  overlay.replaceChildren(frag);
+}
+
+function updateAddToEhrButtonState() {
+  if (!addEhrBtnEl) return;
+
+  if (medicationValidationPending) {
+    addEhrBtnEl.disabled = true;
+  } else {
+    addEhrBtnEl.disabled = true;
+  }
+}
+
 // Inject minimal CSS once (dark-theme friendly)
 function ensureMedStyles() {
   if (document.getElementById('med-inline-css')) return;
@@ -767,11 +887,16 @@ function ensureMedStyles() {
     .med-badge { font-weight: 700; }
     .med-badge.available { color: #22c55e; }   /* green */
     .med-badge.unavailable { color: #ef4444; } /* red   */
+    .med-badge.pending { color: #fbbf24; animation: pulse 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
     .med-wrap { position: relative; }
     .med-overlay {
       position: absolute; inset: 0; pointer-events: none;
       white-space: pre-wrap; overflow: hidden;
       font: inherit; line-height: inherit; color: inherit;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: .5; }
     }
   `;
   document.head.appendChild(s);
@@ -933,6 +1058,14 @@ function handleSignalMessage(packet) {
     if (soapNoteTimer) { clearInterval(soapNoteTimer); soapNoteTimer = null; }
     soapGenerating = false;
     renderSoapNote(latestSoapNote);
+
+    setTimeout(() => {
+      const scroller = soapContainerEnsure();
+      const medTextarea = scroller.querySelector('textarea[data-section="Medication"]');
+      if (medTextarea) {
+        checkMedicationsFromTextarea(medTextarea);
+      }
+    }, 100);
   }
 }
 
@@ -1073,24 +1206,7 @@ function wireSoapActionButtons() {
     ensureTranscriptPlaceholder();
     showNoDevices();
 
-    // ⬇️ Add minimal styles for inline medication badges (dark-friendly)
-    if (!document.getElementById('med-inline-css')) {
-      const s = document.createElement('style');
-      s.id = 'med-inline-css';
-      s.textContent = `
-        .med-line { display: flex; align-items: center; gap: 8px; }
-        .med-badge { font-weight: 700; }
-        .med-badge.available { color: #22c55e; }   /* green */
-        .med-badge.unavailable { color: #ef4444; } /* red   */
-        .med-wrap { position: relative; }
-        .med-overlay {
-          position: absolute; inset: 0; pointer-events: none;
-          white-space: pre-wrap; overflow: hidden;
-          font: inherit; line-height: inherit; color: inherit;
-        }
-      `;
-      document.head.appendChild(s);
-    }
+    ensureMedStyles();
 
     restoreFromLocalStorage();
     wireSoapActionButtons();

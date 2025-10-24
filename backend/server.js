@@ -468,6 +468,115 @@ app.get('/health', async (_req, res) => {
   }
 });
 
+app.post('/api/medications/availability', async (req, res) => {
+  dlog('[MEDICATION_API] request received');
+  try {
+    const { names } = req.body;
+
+    if (!Array.isArray(names)) {
+      return res.status(400).json({ error: 'Expected "names" array in request body' });
+    }
+
+    if (names.length === 0) {
+      return res.json({ results: [] });
+    }
+
+    dlog(`[MEDICATION_API] Checking ${names.length} medication(s)`);
+
+    const schema = 'dbo';
+    const table = 'DrugMaster';
+    const nameCol = 'drug';
+
+    function normalizeTerm(s) {
+      return String(s || '')
+        .toLowerCase()
+        .replace(/[ \-\/\.,'()]/g, '');
+    }
+
+    function extractDrugQuery(raw) {
+      if (!raw) return null;
+      let s = String(raw)
+        .replace(/^[-•]\s*/u, '')
+        .replace(/\(.*?\)/g, '')
+        .replace(/\b(tablet|tablets|tab|tabs|capsule|capsules|cap|caps|syrup|susp(?:ension)?|inj(?:ection)?)\b/gi, '')
+        .replace(/\b(po|od|bd|tid|qid|prn|q\d+h|iv|im|sc|sl)\b/gi, '')
+        .replace(/\b\d+(\.\d+)?\s*(mg|mcg|g|kg|ml|l|iu|units|%)\b/gi, '')
+        .split(/\b\d/)[0]
+        .replace(/[.,;:/]+$/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return s || null;
+    }
+
+    async function findDrugMatch(q) {
+      const raw = String(q || '').trim();
+      const rawLike = `%${raw}%`;
+      const norm = normalizeTerm(raw);
+      const normLike = `%${norm}%`;
+
+      const normExpr = `
+        REPLACE(
+          REPLACE(
+            REPLACE(
+              REPLACE(
+                REPLACE(
+                  REPLACE(
+                    REPLACE(
+                      REPLACE(LOWER([${nameCol}]), '-', ''), ',', ''), '/', ''), '.', ''), '''', ''), ' ', ''), '(', ''), ')', '')
+      `;
+
+      const sql = `
+        SELECT TOP 1 [${nameCol}] AS name
+        FROM [${schema}].[${table}]
+        WHERE status = 1
+          AND [${nameCol}] IS NOT NULL
+          AND (
+            LOWER([${nameCol}]) = LOWER(:raw)
+            OR LOWER([${nameCol}]) LIKE LOWER(:rawLike)
+            OR ${normExpr} = :norm
+            OR ${normExpr} LIKE :normLike
+          )
+        ORDER BY
+          CASE
+            WHEN ${normExpr} = :norm THEN 1
+            WHEN LOWER([${nameCol}]) = LOWER(:raw) THEN 2
+            WHEN ${normExpr} LIKE :normLike THEN 3
+            ELSE 4
+          END,
+          [${nameCol}];
+      `;
+
+      const rows = await sequelize.query(sql, {
+        replacements: { raw, rawLike, norm, normLike },
+        type: Sequelize.QueryTypes.SELECT
+      });
+      return rows?.[0]?.name || null;
+    }
+
+    const results = [];
+    for (const name of names) {
+      const query = extractDrugQuery(name);
+      if (!query) {
+        results.push({ name, available: false });
+        continue;
+      }
+
+      try {
+        const matched = await findDrugMatch(query);
+        results.push({ name, available: !!matched });
+        dlog(`[MEDICATION_API] "${name}" => ${matched ? 'AVAILABLE' : 'NOT FOUND'}`);
+      } catch (e) {
+        dwarn(`[MEDICATION_API] Error checking "${name}":`, e.message);
+        results.push({ name, available: false });
+      }
+    }
+
+    res.json({ results });
+  } catch (err) {
+    derr('[MEDICATION_API] Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 // Service Principal (Local or other fallback)
 sequelize = new Sequelize(process.env.DB_NAME, process.env.DB_CLIENT_ID, process.env.DB_CLIENT_SECRET, {
